@@ -1,0 +1,220 @@
+name: LR6 CI/CD
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  unit-tests:
+    name: Unit | Node ${{ matrix.node }} | ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: [18, 20, 22]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run Jest unit tests
+        run: npm run test:unit
+
+      - name: Upload Jest report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jest-report-${{ matrix.os }}-node-${{ matrix.node }}
+          path: |
+            reports/jest/
+            allure-results/
+          if-no-files-found: ignore
+
+  api-tests:
+    name: API/BDD | Node ${{ matrix.node }} | ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: [18, 20, 22]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run Cucumber API/BDD tests
+        run: npm run test:api
+
+      - name: Upload Cucumber report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cucumber-report-${{ matrix.os }}-node-${{ matrix.node }}
+          path: cucumber-report/
+          if-no-files-found: ignore
+
+  ui-tests:
+    name: UI | ${{ matrix.browser }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, firefox, webkit]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps ${{ matrix.browser }}
+
+      - name: Run Playwright UI tests
+        run: npx playwright test --project=${{ matrix.browser }}
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-${{ matrix.browser }}
+          path: |
+            playwright-report/
+            test-results/
+            allure-results/
+          if-no-files-found: ignore
+
+  allure-report:
+    name: Build Allure report
+    runs-on: ubuntu-latest
+    needs: [unit-tests, api-tests, ui-tests]
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+
+      - name: Run tests for unified Allure results
+        run: npm run test:all
+
+      - name: Generate Allure report
+        run: npm run allure:generate
+
+      - name: Upload Allure artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: allure-report
+          path: allure-report/
+          if-no-files-found: ignore
+
+      - name: Upload Pages artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: allure-report/
+
+  deploy-pages:
+    name: Deploy Allure to GitHub Pages
+    runs-on: ubuntu-latest
+    needs: allure-report
+    if: github.event_name != 'pull_request'
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+  docker-smoke:
+    name: Docker smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t validator-app:ci .
+
+      - name: Run container
+        run: |
+          docker run -d --name validator-app -p 3000:3000 validator-app:ci
+          npx wait-on http://127.0.0.1:3000/api/health
+
+      - name: Smoke check
+        run: curl --fail http://127.0.0.1:3000/api/health
+
+      - name: Stop container
+        if: always()
+        run: docker rm -f validator-app || true
+
+  notify-telegram:
+    name: Telegram notification
+    runs-on: ubuntu-latest
+    needs: [unit-tests, api-tests, ui-tests, allure-report, docker-smoke]
+    if: always()
+    steps:
+      - name: Send Telegram message
+        shell: bash
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "Telegram secrets are not configured"
+            exit 0
+          fi
+
+          if [ "${{ needs.unit-tests.result }}" = "success" ] && \
+             [ "${{ needs.api-tests.result }}" = "success" ] && \
+             [ "${{ needs.ui-tests.result }}" = "success" ] && \
+             [ "${{ needs.docker-smoke.result }}" = "success" ]; then
+            STATUS="✅ LR6 CI/CD completed successfully"
+          else
+            STATUS="❌ LR6 CI/CD finished with errors"
+          fi
+
+          MESSAGE="$STATUS%0ARepository: ${{ github.repository }}%0ABranch: ${{ github.ref_name }}%0ARun: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            -d text="$MESSAGE"
