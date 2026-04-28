@@ -5,3 +5,4 @@ playwright-report/
 reports/
 cucumber-report/
 test-results/
+.idea
