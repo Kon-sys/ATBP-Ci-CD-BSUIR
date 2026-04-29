@@ -1,4 +1,4 @@
-name: LR6 CI/CD
+name: CI/CD for automated tests
 
 on:
   push:
@@ -23,96 +23,127 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
         node: [18, 20, 22]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
           cache: npm
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
-      - name: Run Jest unit tests
+      - name: Run unit tests
         run: npm run test:unit
 
-      - name: Upload Jest report
+      - name: Upload unit test artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: jest-report-${{ matrix.os }}-node-${{ matrix.node }}
+          name: unit-${{ matrix.os }}-node-${{ matrix.node }}
           path: |
-            reports/jest/
+            coverage/
             allure-results/
           if-no-files-found: ignore
+          retention-days: 14
 
   api-tests:
-    name: API/BDD | Node ${{ matrix.node }} | ${{ matrix.os }}
+    name: API | Node ${{ matrix.node }} | ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
         node: [18, 20, 22]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
           cache: npm
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
-      - name: Run Cucumber API/BDD tests
+      - name: Start application
+        shell: bash
+        run: |
+          npm start &
+          npx wait-on http://127.0.0.1:3000
+
+      - name: Run API tests
         run: npm run test:api
 
-      - name: Upload Cucumber report
+      - name: Upload API artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cucumber-report-${{ matrix.os }}-node-${{ matrix.node }}
-          path: cucumber-report/
+          name: api-${{ matrix.os }}-node-${{ matrix.node }}
+          path: |
+            coverage/
+            allure-results/
+            cucumber-report/
           if-no-files-found: ignore
+          retention-days: 14
 
   ui-tests:
-    name: UI | ${{ matrix.browser }}
+    name: UI | Node 20 | Ubuntu | ${{ matrix.browser }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         browser: [chromium, firefox, webkit]
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
-      - name: Install Playwright browser
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-
+
+      - name: Install Playwright browsers
         run: npx playwright install --with-deps ${{ matrix.browser }}
 
-      - name: Run Playwright UI tests
+      - name: Start application
+        run: |
+          npm start &
+          npx wait-on http://127.0.0.1:3000
+
+      - name: Run UI tests
         run: npx playwright test --project=${{ matrix.browser }}
 
-      - name: Upload Playwright report
+      - name: Upload UI artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: playwright-report-${{ matrix.browser }}
+          name: ui-${{ matrix.browser }}
           path: |
             playwright-report/
             test-results/
             allure-results/
           if-no-files-found: ignore
+          retention-days: 14
 
   allure-report:
     name: Build Allure report
@@ -120,44 +151,52 @@ jobs:
     needs: [unit-tests, api-tests, ui-tests]
     if: always()
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
-      - name: Install Playwright browser
-        run: npx playwright install --with-deps chromium
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
 
-      - name: Run tests for unified Allure results
-        run: npm run test:all
+      - name: Merge Allure results
+        shell: bash
+        run: |
+          mkdir -p merged-allure-results
+          find artifacts -type f \( -name '*.json' -o -name '*.txt' -o -name '*.png' -o -name '*.jpg' -o -name '*.jpeg' -o -name '*.webm' -o -name '*.xml' -o -name '*.csv' \) -exec cp {} merged-allure-results/ \;
 
       - name: Generate Allure report
-        run: npm run allure:generate
+        run: npx allure generate merged-allure-results --clean -o allure-report
 
-      - name: Upload Allure artifact
+      - name: Upload Allure report artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: allure-report
           path: allure-report/
-          if-no-files-found: ignore
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Upload Pages artifact
-        if: github.event_name != 'pull_request'
+        if: github.ref == 'refs/heads/main'
         uses: actions/upload-pages-artifact@v3
         with:
           path: allure-report/
 
   deploy-pages:
     name: Deploy Allure to GitHub Pages
-    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
     needs: allure-report
-    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -170,7 +209,8 @@ jobs:
     name: Docker smoke test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v5
 
       - name: Build Docker image
         run: docker build -t validator-app:ci .
@@ -178,10 +218,10 @@ jobs:
       - name: Run container
         run: |
           docker run -d --name validator-app -p 3000:3000 validator-app:ci
-          npx wait-on http://127.0.0.1:3000/api/health
+          npx wait-on http://127.0.0.1:3000
 
       - name: Smoke check
-        run: curl --fail http://127.0.0.1:3000/api/health
+        run: curl --fail http://127.0.0.1:3000
 
       - name: Stop container
         if: always()
@@ -189,9 +229,9 @@ jobs:
 
   notify-telegram:
     name: Telegram notification
-    runs-on: ubuntu-latest
-    needs: [unit-tests, api-tests, ui-tests, allure-report, docker-smoke]
     if: always()
+    needs: [unit-tests, api-tests, ui-tests, allure-report, deploy-pages, docker-smoke]
+    runs-on: ubuntu-latest
     steps:
       - name: Send Telegram message
         shell: bash
@@ -200,20 +240,21 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
-            echo "Telegram secrets are not configured"
+            echo "Telegram secrets are not configured."
             exit 0
           fi
 
           if [ "${{ needs.unit-tests.result }}" = "success" ] && \
              [ "${{ needs.api-tests.result }}" = "success" ] && \
              [ "${{ needs.ui-tests.result }}" = "success" ] && \
+             [ "${{ needs.allure-report.result }}" = "success" ] && \
              [ "${{ needs.docker-smoke.result }}" = "success" ]; then
-            STATUS="✅ LR6 CI/CD completed successfully"
+            STATUS="✅ Все автотесты успешно пройдены"
           else
-            STATUS="❌ LR6 CI/CD finished with errors"
+            STATUS="❌ В CI/CD pipeline есть ошибки"
           fi
 
-          MESSAGE="$STATUS%0ARepository: ${{ github.repository }}%0ABranch: ${{ github.ref_name }}%0ARun: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          MESSAGE="$STATUS%0A%0A🧪 Лабораторная работа №6%0A⚙️ Настройка CI/CD для комплексных автоматизированных тестов%0A%0A📌 Репозиторий: ${{ github.repository }}%0A🌿 Ветка: ${{ github.ref_name }}%0A🔢 Запуск: #${{ github.run_number }}%0A👤 Автор: ${{ github.actor }}%0A%0A📊 Unit tests: ${{ needs.unit-tests.result }}%0A🔗 API/BDD tests: ${{ needs.api-tests.result }}%0A🖥 UI tests: ${{ needs.ui-tests.result }}%0A📄 Allure report: ${{ needs.allure-report.result }}%0A🚀 GitHub Pages: ${{ needs.deploy-pages.result }}%0A🐳 Docker smoke: ${{ needs.docker-smoke.result }}%0A%0A🔗 Workflow:%0Ahttps://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
